@@ -1,25 +1,19 @@
 services:
-  # ── Gemma 2B API ─────────────────────────────────────────────────────
-  # Runs llama-cpp-python with a Q4_K_M GGUF — needs ~2 GB RAM.
-  # Use "standard" plan ($7/mo, 2 GB RAM, 2 vCPU) or higher.
-  # The model is downloaded once and stored on the Persistent Disk below.
+  # ── Gemma 2B API (FastAPI + Google AI Studio) ──────────────────────────
+  # Uses google-generativeai SDK — no model loaded locally, runs in ~50 MB RAM.
+  # Render FREE plan works perfectly. No credit card required.
   - type: web
     name: street-hunt-api
     env: docker
     region: ohio
-    plan: standard
+    plan: free               # Free plan — 512 MB RAM is plenty for API calls
     dockerfilePath: ./backend/Dockerfile
     envVars:
-      - key: MODEL_DIR
-        value: /var/data           # matches the disk mountPath below
-      - key: HF_TOKEN
-        sync: false                # optional for this public model; set if needed
-    disk:
-      name: gemma-model-cache
-      mountPath: /var/data
-      sizeGB: 5                    # 1.5 GB model + room to breathe
+      - key: GOOGLE_API_KEY  # Get free at https://aistudio.google.com/
+        sync: false          # Set this securely in the Render dashboard
 
-  # ── Svelte Frontend (Static) ──────────────────────────────────────────
+  # ── Svelte Frontend (Static Site) ─────────────────────────────────────
+  # Also completely free. No credit card required.
   - type: web
     name: street-hunt-app
     env: static

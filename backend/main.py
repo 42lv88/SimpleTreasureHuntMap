@@ -1,42 +1,40 @@
 """
-Treasure Hunt API — Gemma 2B running locally on Render via llama-cpp-python.
+Treasure Hunt API — Gemma 2B via Google AI Studio (free, no card needed).
 
-How it works:
-  1. On first startup the server downloads the GGUF model (~1.5 GB) from
-     HuggingFace Hub into MODEL_DIR (a Render Persistent Disk mount).
-  2. llama-cpp-python loads the model and runs pure-CPU inference.
-  3. No torch, no transformers, no GPU needed — works on Render's Standard plan.
+Setup:
+  1. Go to https://aistudio.google.com/ and sign in with your Google account.
+  2. Click 'Get API Key' → 'Create API key'. That's it — completely free.
+  3. Set that key as GOOGLE_API_KEY in Render's Environment Variables
+     (or in your local .env file for dev).
 
-Env vars (set in Render dashboard or .env):
-  HF_TOKEN   — optional; only needed if you switch to a gated HF repo
-  MODEL_DIR  — path to the Render Persistent Disk (default: /var/data)
+Runs on Render's FREE tier (512 MB RAM) since no model is loaded locally.
 """
-
 import os
 import logging
-from pathlib import Path
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
-from huggingface_hub import hf_hub_download
-from llama_cpp import Llama
+import google.generativeai as genai
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# ── Model config ────────────────────────────────────────────────────────
-# bartowski/gemma-2-2b-it-GGUF is a public, no-auth repo with Q4 quants.
-# Q4_K_M quantization: ~1.5 GB RAM, good quality/speed trade-off on CPU.
-HF_REPO   = "bartowski/gemma-2-2b-it-GGUF"
-HF_FILE   = "gemma-2-2b-it-Q4_K_M.gguf"
-MODEL_DIR = Path(os.getenv("MODEL_DIR", "/var/data"))
-MODEL_PATH = MODEL_DIR / HF_FILE
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
 
-# ── App ──────────────────────────────────────────────────────────────────
-app = FastAPI(title="Street Hunt – Gemma 2B on Render")
+# Configure the Google Generative AI client
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
+    # Use Gemma 2B via AI Studio — model ID for Gemma 2 2B instruction-tuned
+    gemma_model = genai.GenerativeModel("gemma-2-2b-it")
+    log.info("Google AI Studio configured with Gemma 2B ✓")
+else:
+    gemma_model = None
+    log.warning("GOOGLE_API_KEY not set — riddle fallback will be used.")
+
+app = FastAPI(title="Street Hunt – Gemma 2B via Google AI Studio")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,83 +42,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-llm: Llama | None = None
-
-
-@app.on_event("startup")
-def load_model() -> None:
-    global llm
-
-    # Download model to persistent disk if not already present
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    if not MODEL_PATH.exists():
-        log.info("Downloading Gemma 2B GGUF (~1.5 GB). This runs once and is cached on disk…")
-        hf_hub_download(
-            repo_id=HF_REPO,
-            filename=HF_FILE,
-            local_dir=str(MODEL_DIR),
-            token=os.getenv("HF_TOKEN") or None,  # optional for this public repo
-        )
-        log.info("Download complete.")
-    else:
-        log.info("Model already cached at %s", MODEL_PATH)
-
-    log.info("Loading Gemma 2B into llama-cpp…")
-    llm = Llama(
-        model_path=str(MODEL_PATH),
-        n_ctx=512,          # context window — keep small to save RAM
-        n_threads=2,        # Render Standard has 2 vCPU
-        verbose=False,
-    )
-    log.info("Model ready ✓")
-
-
-# ── Endpoints ────────────────────────────────────────────────────────────
 
 class RiddleRequest(BaseModel):
     street: str
     distance: int
 
 
+FALLBACK_RIDDLES = [
+    "I'm a path that stretches far and wide,\n{d} meters from where you stand with pride.\nMy name hangs on a sign — find me to decide! 🗺️",
+    "Winds carry my name through the city air,\n{d} steps away, if you only dare.\nLook for my board and claim your trophy rare! 🏆",
+]
+
+
 @app.post("/generate-riddle")
 async def generate_riddle(req: RiddleRequest) -> dict:
-    if llm is None:
-        return {
-            "riddle": (
-                f"I wind through the city, {req.distance} meters near,\n"
-                "Seek the sign that bears my name with care.\n"
-                "Street explorers who find me win the game! 🗺️"
-            )
-        }
+    if not gemma_model:
+        import random
+        template = random.choice(FALLBACK_RIDDLES)
+        return {"riddle": template.format(d=req.distance)}
 
     prompt = (
-        f"<start_of_turn>user\n"
-        f"Write a short, fun riddle (2-3 lines) about a street named '{req.street}'. "
+        f"Write a fun, short riddle (2–3 lines, under 40 words) about a street named '{req.street}'. "
         f"The player is {req.distance} meters away from it. "
-        f"Do NOT say the street name. Make it feel like a Pokémon GO adventure clue!\n"
-        f"<end_of_turn>\n<start_of_turn>model\n"
+        f"Do NOT reveal the street name. Make it feel like a Pokémon GO adventure clue. "
+        f"Output only the riddle text, nothing else."
     )
 
     try:
-        output = llm(
+        response = gemma_model.generate_content(
             prompt,
-            max_tokens=90,
-            temperature=0.8,
-            top_p=0.95,
-            stop=["<end_of_turn>", "<start_of_turn>"],
-            echo=False,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.85,
+                max_output_tokens=80,
+            ),
         )
-        riddle = output["choices"][0]["text"].strip()
+        riddle = response.text.strip()
         return {"riddle": riddle}
     except Exception as exc:
-        log.error("Inference error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        log.error("Gemma API error: %s", exc)
+        # Graceful fallback so the game always continues
+        return {"riddle": f"I lie {req.distance} meters from your feet, a hidden street. 🗺️ Find my sign to complete the feat!"}
 
 
 @app.get("/")
 def healthcheck() -> dict:
     return {
         "status": "ok",
-        "model": HF_FILE,
-        "model_loaded": llm is not None,
+        "model": "gemma-2-2b-it (Google AI Studio)",
+        "api_configured": gemma_model is not None,
     }
