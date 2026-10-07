@@ -22,9 +22,7 @@ services:
   # ── Svelte Frontend (Static) ──────────────────────────────────────────
   - type: web
     name: street-hunt-app
-    env: node
-    region: ohio
-    plan: free
+    env: static
     buildCommand: cd frontend && npm install && npm run build
     staticPublishPath: ./frontend/dist
     envVars:

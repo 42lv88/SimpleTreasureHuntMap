@@ -143,9 +143,12 @@
   /* ─── Riddle ─────────────────────────────────────── */
   async function fetchRiddle() {
     loadingRiddle = true;
-    try {
-      const BACKEND = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
-      const r = await fetch(`${BACKEND}/generate-riddle`, {
+      let backend = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
+      if (!backend.startsWith('http://') && !backend.startsWith('https://')) {
+        backend = `https://${backend}`;
+      }
+      backend = backend.replace(/\/$/, '');
+      const r = await fetch(`${backend}/generate-riddle`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ street: streetName, distance })
