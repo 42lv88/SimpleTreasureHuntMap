@@ -21,7 +21,5 @@ services:
     staticPublishPath: ./frontend/dist
     envVars:
       - key: VITE_BACKEND_URL
-        fromService:
-          name: street-hunt-api
-          type: web
-          property: host
+        # Render service URLs are always: https://<name>.onrender.com
+        value: https://street-hunt-api.onrender.com
