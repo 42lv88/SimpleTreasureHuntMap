@@ -24,9 +24,14 @@
     map = L.map('map', { zoomControl: false, attributionControl: true })
            .setView([20, 78], 4);
 
+    // OSM tiles are free with no API key — dark filter applied via CSS class below
     L.tileLayer(
-      'https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',
-      { attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>', maxZoom: 19 }
+      'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+      {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19,
+        className: 'dark-tiles'   // CSS class applies the dark invert filter
+      }
     ).addTo(map);
 
     // Zoom control bottom-right

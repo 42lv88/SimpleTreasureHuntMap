@@ -71,3 +71,4 @@ def healthcheck() -> dict:
 
 # Vercel ASGI handler
 handler = Mangum(app, lifespan="off")
+

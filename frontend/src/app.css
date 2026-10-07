@@ -46,3 +46,9 @@ html, body {
 .leaflet-control-attribution a {
   color: var(--poke-blue) !important;
 }
+
+/* Free OpenStreetMap Dark Mode Filter - No API Key Required */
+.dark-tiles {
+  filter: brightness(0.6) invert(1) contrast(2.5) hue-rotate(185deg) saturate(0.6) !important;
+}
+
