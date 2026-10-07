@@ -1,0 +1,35 @@
+services:
+  # ── Gemma 2B API ─────────────────────────────────────────────────────
+  # Runs llama-cpp-python with a Q4_K_M GGUF — needs ~2 GB RAM.
+  # Use "standard" plan ($7/mo, 2 GB RAM, 2 vCPU) or higher.
+  # The model is downloaded once and stored on the Persistent Disk below.
+  - type: web
+    name: street-hunt-api
+    env: docker
+    region: ohio
+    plan: standard
+    dockerfilePath: ./backend/Dockerfile
+    envVars:
+      - key: MODEL_DIR
+        value: /var/data           # matches the disk mountPath below
+      - key: HF_TOKEN
+        sync: false                # optional for this public model; set if needed
+    disk:
+      name: gemma-model-cache
+      mountPath: /var/data
+      sizeGB: 5                    # 1.5 GB model + room to breathe
+
+  # ── Svelte Frontend (Static) ──────────────────────────────────────────
+  - type: web
+    name: street-hunt-app
+    env: node
+    region: ohio
+    plan: free
+    buildCommand: cd frontend && npm install && npm run build
+    staticPublishPath: ./frontend/dist
+    envVars:
+      - key: VITE_BACKEND_URL
+        fromService:
+          name: street-hunt-api
+          type: web
+          property: host

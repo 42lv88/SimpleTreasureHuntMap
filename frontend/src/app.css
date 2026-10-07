@@ -1,0 +1,48 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  -webkit-tap-highlight-color: transparent;
+}
+
+:root {
+  --poke-blue: #3d7dca;
+  --poke-blue-dark: #1a3a6b;
+  --poke-yellow: #ffcb05;
+  --poke-red: #cc0000;
+  --poke-red-light: #ff4444;
+  --poke-white: #f8f8f8;
+  --poke-dark: #1a1a2e;
+  --poke-panel: rgba(16, 16, 36, 0.92);
+  --glass-border: rgba(255, 255, 255, 0.15);
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+  font-family: 'Exo 2', 'Segoe UI', sans-serif;
+  background: var(--poke-dark);
+  color: var(--poke-white);
+}
+
+#app {
+  height: 100%;
+  width: 100%;
+}
+
+/* Leaflet custom styles */
+.leaflet-control-zoom a {
+  background: var(--poke-panel) !important;
+  color: var(--poke-yellow) !important;
+  border: 1px solid var(--glass-border) !important;
+  font-family: 'Exo 2', sans-serif !important;
+}
+.leaflet-control-attribution {
+  background: rgba(0,0,0,0.5) !important;
+  color: rgba(255,255,255,0.5) !important;
+  font-size: 9px !important;
+}
+.leaflet-control-attribution a {
+  color: var(--poke-blue) !important;
+}
