@@ -143,12 +143,12 @@
   /* ─── Riddle ─────────────────────────────────────── */
   async function fetchRiddle() {
     loadingRiddle = true;
-      let backend = import.meta.env.VITE_BACKEND_URL || 'http://localhost:8000';
-      if (!backend.startsWith('http://') && !backend.startsWith('https://')) {
-        backend = `https://${backend}`;
-      }
-      backend = backend.replace(/\/$/, '');
-      const r = await fetch(`${backend}/generate-riddle`, {
+    try {
+      // On Vercel, /api is same-origin — no env var needed.
+      // For local dev, set VITE_BACKEND_URL=http://localhost:8000 in .env
+      const apiBase = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
+      const url = apiBase ? `${apiBase}/api/generate-riddle` : '/api/generate-riddle';
+      const r = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ street: streetName, distance })
@@ -160,6 +160,7 @@
     }
     loadingRiddle = false;
   }
+
 
   /* ─── Camera ─────────────────────────────────────── */
   async function openCamera() {
