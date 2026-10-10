@@ -7,10 +7,14 @@
   let questMarkers = [];
   let questLines   = [];
 
-  let phase = 'gps';  // gps | loading | questing | detail | camera | verifying | result | victory
+  let phase = 'config';  // config | gps | loading | questing | detail | camera | verifying | result | victory
   let quests  = [];   // [{id, lat, lng, street, riddle, nominalDist}]
   let statuses = {};  // { 0: null|'found'|'wrong', 1: ..., 2: ... }
   let distances = {}; // { 0: metres, 1: ..., 2: ... } — live
+
+  let customBackendUrl = typeof localStorage !== 'undefined' ? (localStorage.getItem('STH_BACKEND_URL') || '') : '';
+  let configError = '';
+  let apiBase = '';
 
   let currentPos = null;
   let gpsError   = '';
@@ -45,8 +49,31 @@
     }).addTo(map);
 
     L.control.zoom({ position: 'bottomright' }).addTo(map);
-    startGPS();
+    // startGPS() will be called after successful config
   });
+
+  async function connectServer() {
+    configError = '';
+    let url = customBackendUrl.trim().replace(/\/$/, '');
+    if (!url) { configError = 'Please enter a valid URL'; return; }
+    if (!url.startsWith('http')) url = 'https://' + url;
+    
+    try {
+      const r = await fetch(`${url}/api`);
+      if (!r.ok) throw new Error('Server error');
+      const data = await r.json();
+      if (data.status === 'ok') {
+        apiBase = url;
+        localStorage.setItem('STH_BACKEND_URL', url);
+        phase = 'gps';
+        startGPS();
+      } else {
+        configError = 'Server returned invalid response.';
+      }
+    } catch (e) {
+      configError = 'Cannot connect. Check URL and ensure backend is running.';
+    }
+  }
 
   onDestroy(() => {
     if (watcher) navigator.geolocation.clearWatch(watcher);
@@ -95,7 +122,6 @@
   async function loadQuests(lat, lng) {
     phase = 'loading';
     try {
-      const apiBase = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
       const url = apiBase ? `${apiBase}/api/generate-quests` : '/api/generate-quests';
       const r = await fetch(url, {
         method: 'POST',
@@ -200,7 +226,6 @@
     verifying = true;
     phase = 'verifying';
     try {
-      const apiBase = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
       const url = apiBase ? `${apiBase}/api/verify-sign` : '/api/verify-sign';
       const fd = new FormData();
       fd.append('file', photoFile);
@@ -280,6 +305,27 @@
   <!-- Hidden file input for photo capture / gallery -->
   <input bind:this={fileInput} type="file" accept="image/*" style="display:none"
     on:change={onFileSelected} />
+
+  <!-- ── Config (Backend URL) ── -->
+  {#if phase === 'config'}
+  <div class="overlay center">
+    <div class="splash-card config-card">
+      <h1 class="title-glow" style="font-size:1.6rem">Wand Setup</h1>
+      <p class="sub">Connect to your local Ollama & OCR server.</p>
+      
+      <input type="url" class="config-input" 
+             placeholder="https://your-ngrok-url.app" 
+             bind:value={customBackendUrl} 
+             on:keydown={e => e.key === 'Enter' && connectServer()} />
+      
+      {#if configError}<p class="err" style="margin-top:0">{configError}</p>{/if}
+      
+      <button class="cta-btn green" style="width:100%" on:click={connectServer}>
+        🔗 Connect Server
+      </button>
+    </div>
+  </div>
+  {/if}
 
   <!-- ── GPS waiting ── -->
   {#if phase === 'gps'}
@@ -504,6 +550,17 @@
   }
   .sub  { color: rgba(255,255,255,0.65); font-size: 0.9rem; }
   .err  { color: #ff6b6b; font-size: 0.85rem; }
+
+  /* ── Config Screen ── */
+  .config-card { width: 100%; max-width: 360px; }
+  .config-input {
+    width: 100%; padding: 0.9rem; border-radius: 12px;
+    border: 1px solid rgba(255,203,5,0.4);
+    background: rgba(0,0,0,0.5); color: white;
+    font-family: 'Exo 2', sans-serif; font-size: 1rem;
+    text-align: center; margin-top: 0.5rem; outline: none;
+  }
+  .config-input:focus { border-color: #ffcb05; box-shadow: 0 0 10px rgba(255,203,5,0.3); }
 
   /* ── HUD ── */
   .hud-top {
