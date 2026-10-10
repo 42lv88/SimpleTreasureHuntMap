@@ -1,19 +1,6 @@
 services:
-  # ── Gemma 2B API (FastAPI + Google AI Studio) ──────────────────────────
-  # Uses google-generativeai SDK — no model loaded locally, runs in ~50 MB RAM.
-  # Render FREE plan works perfectly. No credit card required.
-  - type: web
-    name: street-hunt-api
-    env: docker
-    region: ohio
-    plan: free               # Free plan — 512 MB RAM is plenty for API calls
-    dockerfilePath: ./backend/Dockerfile
-    envVars:
-      - key: GOOGLE_API_KEY  # Get free at https://aistudio.google.com/
-        sync: false          # Set this securely in the Render dashboard
-
-  # ── Svelte Frontend (Static Site) ─────────────────────────────────────
-  # Also completely free. No credit card required.
+  # ── Frontend: Svelte static site ─────────────────────────────────────────
+  # Hosted for free on Render.
   - type: web
     name: street-hunt-app
     env: static
@@ -21,5 +8,4 @@ services:
     staticPublishPath: ./frontend/dist
     envVars:
       - key: VITE_BACKEND_URL
-        # Render service URLs are always: https://<name>.onrender.com
-        value: https://street-hunt-api.onrender.com
+        sync: false   # Set this in the Render Dashboard to your local backend's public URL (e.g. ngrok)
