@@ -299,7 +299,7 @@
     <div class="splash-card">
       <div class="spin-icon">📜</div>
       <h2 class="title-glow" style="font-size:1.5rem">Consulting the Marauder's Map…</h2>
-      <p class="sub">Gemma 2B is conjuring 3 mystical quests</p>
+      <p class="sub">Gemini is conjuring 3 mystical quests…</p>
     </div>
   </div>
   {/if}
@@ -362,7 +362,7 @@
       <div class="parchment-card">
         <div class="parchment-header">
           <span>📜</span>
-          <span>The Marauder's Clue · Gemma 2B</span>
+          <span>The Marauder's Clue · Gemini Flash</span>
         </div>
         <p class="parchment-text">{activeQuest.riddle}</p>
       </div>
