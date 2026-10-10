@@ -2,715 +2,724 @@
   import { onMount, onDestroy } from 'svelte';
   import L from 'leaflet';
 
-  /* ─── State ─────────────────────────────────────── */
-  let map, playerMarker, targetMarker, accuracyCircle, line;
-  let currentPos   = null;   // L.LatLng
-  let targetPos    = null;   // L.LatLng
-  let streetName   = '';
-  let distance     = 0;
-  let riddle       = '';
-  let phase        = 'gps';  // gps | hunting | camera | captured | solved
-  let loadingRiddle = false;
-  let gpsError     = '';
+  // ── State ────────────────────────────────────────────────────────────
+  let map, playerMarker, accuracyCircle;
+  let questMarkers = [];
+  let questLines   = [];
+
+  let phase = 'gps';  // gps | loading | questing | detail | camera | verifying | result | victory
+  let quests  = [];   // [{id, lat, lng, street, riddle, nominalDist}]
+  let statuses = {};  // { 0: null|'found'|'wrong', 1: ..., 2: ... }
+  let distances = {}; // { 0: metres, 1: ..., 2: ... } — live
+
+  let currentPos = null;
+  let gpsError   = '';
   let watcher;
 
-  /* Camera */
-  let videoEl, canvasEl;
-  let photoUrl = '';
-  let cameraStream;
+  // Active quest flow
+  let activeId = null;
+  $: activeQuest = quests.find(q => q.id === activeId);
 
-  /* ─── Lifecycle ──────────────────────────────────── */
+  // Upload / camera
+  let fileInput;
+  let photoFile = null;
+  let photoPreviewUrl = '';
+
+  // Verification
+  let verifying = false;
+  let verifyResult = null;  // {matched, ocr_text, street, confidence}
+
+  // Computed
+  $: score   = Object.values(statuses).filter(s => s === 'found').length;
+  $: victory = score === 3;
+
+  // ── Lifecycle ────────────────────────────────────────────────────────
   onMount(() => {
     map = L.map('map', { zoomControl: false, attributionControl: true })
            .setView([20, 78], 4);
 
-    // OSM tiles are free with no API key — dark filter applied via CSS class below
-    L.tileLayer(
-      'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-      {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-        maxZoom: 19,
-        className: 'dark-tiles'   // CSS class applies the dark invert filter
-      }
-    ).addTo(map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      maxZoom: 19,
+      className: 'dark-tiles',
+    }).addTo(map);
 
-    // Zoom control bottom-right
     L.control.zoom({ position: 'bottomright' }).addTo(map);
-
     startGPS();
   });
 
   onDestroy(() => {
     if (watcher) navigator.geolocation.clearWatch(watcher);
-    stopCamera();
   });
 
-  /* ─── GPS ────────────────────────────────────────── */
+  // ── GPS ──────────────────────────────────────────────────────────────
   function startGPS() {
-    if (!('geolocation' in navigator)) {
-      gpsError = 'Geolocation not supported by this browser.';
-      return;
-    }
-    watcher = navigator.geolocation.watchPosition(
-      onGPS,
-      (e) => { gpsError = e.message; },
-      { enableHighAccuracy: true, maximumAge: 0 }
-    );
+    if (!('geolocation' in navigator)) { gpsError = 'Geolocation not supported.'; return; }
+    watcher = navigator.geolocation.watchPosition(onGPS, e => { gpsError = e.message; },
+      { enableHighAccuracy: true, maximumAge: 0 });
   }
 
+  let questsLoaded = false;
   function onGPS(pos) {
     gpsError = '';
-    const lat = pos.coords.latitude;
-    const lng = pos.coords.longitude;
+    currentPos = L.latLng(pos.coords.latitude, pos.coords.longitude);
     const acc = pos.coords.accuracy;
-    currentPos = L.latLng(lat, lng);
 
-    // Player marker
     if (!playerMarker) {
       playerMarker = L.marker(currentPos, { icon: playerIcon() }).addTo(map);
-      map.setView(currentPos, 17);
-      if (phase === 'gps') {
-        phase = 'loading';
-        spawnTarget(lat, lng);
-      }
+      map.setView(currentPos, 16);
     } else {
       playerMarker.setLatLng(currentPos);
     }
 
-    // Accuracy ring
     if (accuracyCircle) accuracyCircle.setLatLng(currentPos).setRadius(acc);
     else accuracyCircle = L.circle(currentPos, { radius: acc, color: '#3d7dca', fillColor: '#3d7dca', fillOpacity: 0.08, weight: 1 }).addTo(map);
 
-    if (targetPos) {
-      distance = Math.round(currentPos.distanceTo(targetPos));
-      if (line) line.setLatLngs([currentPos, targetPos]);
+    // Update live distances
+    quests.forEach(q => {
+      distances[q.id] = Math.round(currentPos.distanceTo(L.latLng(q.lat, q.lng)));
+    });
+    distances = { ...distances };
+
+    // Update dashed lines
+    updateLines();
+
+    // Load quests once on first GPS fix
+    if (!questsLoaded && phase === 'gps') {
+      questsLoaded = true;
+      loadQuests(pos.coords.latitude, pos.coords.longitude);
     }
   }
 
-  function playerIcon() {
-    return L.divIcon({
-      className: '',
-      html: `
-        <div class="player-dot">
-          <div class="player-pulse"></div>
-          <div class="player-inner">🧍</div>
-        </div>`,
-      iconSize: [48, 48],
-      iconAnchor: [24, 24],
-    });
-  }
-
-  function targetIcon() {
-    return L.divIcon({
-      className: '',
-      html: `<div class="target-pin">📍</div>`,
-      iconSize: [40, 40],
-      iconAnchor: [20, 40],
-    });
-  }
-
-  /* ─── Spawn Target ───────────────────────────────── */
-  async function spawnTarget(lat, lng) {
-    // Random offset ~100–400 m away
-    const dlat = (Math.random() - 0.5) * 0.006;
-    const dlng = (Math.random() - 0.5) * 0.006;
-    targetPos = L.latLng(lat + dlat, lng + dlng);
-    distance  = Math.round(currentPos.distanceTo(targetPos));
-
-    targetMarker = L.marker(targetPos, { icon: targetIcon() }).addTo(map);
-    line = L.polyline([currentPos, targetPos], {
-      color: '#ffcb05', weight: 2, dashArray: '6 10', opacity: 0.6
-    }).addTo(map);
-    map.fitBounds(L.latLngBounds(currentPos, targetPos), { padding: [60, 60] });
-
-    // Reverse-geocode
+  // ── Load Quests ──────────────────────────────────────────────────────
+  async function loadQuests(lat, lng) {
+    phase = 'loading';
     try {
-      const r = await fetch(
-        `https://nominatim.openstreetmap.org/reverse?format=json&lat=${targetPos.lat}&lon=${targetPos.lng}`
-      );
-      const d = await r.json();
-      streetName =
-        d.address?.road ||
-        d.address?.pedestrian ||
-        d.address?.path ||
-        d.address?.suburb ||
-        d.name ||
-        'Mystery Lane';
-    } catch {
-      streetName = 'Mystery Lane';
-    }
-
-    phase = 'loading_riddle';
-    await fetchRiddle();
-    phase = 'hunting';
-  }
-
-  /* ─── Riddle ─────────────────────────────────────── */
-  async function fetchRiddle() {
-    loadingRiddle = true;
-    try {
-      // On Vercel, /api is same-origin — no env var needed.
-      // For local dev, set VITE_BACKEND_URL=http://localhost:8000 in .env
       const apiBase = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
-      const url = apiBase ? `${apiBase}/api/generate-riddle` : '/api/generate-riddle';
+      const url = apiBase ? `${apiBase}/api/generate-quests` : '/api/generate-quests';
       const r = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ street: streetName, distance })
+        body: JSON.stringify({ lat, lng }),
       });
-      const d = await r.json();
-      riddle = d.riddle;
-    } catch {
-      riddle = `I'm a pathway ${distance}m from you, hidden in plain sight. Find my sign to claim your victory! 🗺️`;
-    }
-    loadingRiddle = false;
-  }
-
-
-  /* ─── Camera ─────────────────────────────────────── */
-  async function openCamera() {
-    phase = 'camera';
-    try {
-      cameraStream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+      const data = await r.json();
+      quests = data.quests;
+      quests.forEach(q => {
+        statuses[q.id] = null;
+        distances[q.id] = currentPos
+          ? Math.round(currentPos.distanceTo(L.latLng(q.lat, q.lng)))
+          : q.nominalDist;
       });
-      await new Promise(r => setTimeout(r, 100));
-      videoEl.srcObject = cameraStream;
+      statuses  = { ...statuses };
+      distances = { ...distances };
+      placeQuestMarkers();
+      if (currentPos) map.setView(currentPos, 15);
+      phase = 'questing';
     } catch (e) {
-      alert('Camera permission denied or unavailable.');
-      phase = 'hunting';
+      gpsError = 'Failed to load quests. Check API.';
+      phase = 'gps';
+      questsLoaded = false;
     }
   }
 
-  function takePhoto() {
-    const ctx = canvasEl.getContext('2d');
-    canvasEl.width  = videoEl.videoWidth;
-    canvasEl.height = videoEl.videoHeight;
-    ctx.drawImage(videoEl, 0, 0);
-    photoUrl = canvasEl.toDataURL('image/jpeg', 0.85);
-    stopCamera();
-    phase = 'captured';
+  // ── Map: Markers & Lines ─────────────────────────────────────────────
+  function playerIcon() {
+    return L.divIcon({
+      className: '',
+      html: `<div class="player-dot"><div class="player-pulse"></div><div class="player-inner">🧙</div></div>`,
+      iconSize: [48, 48], iconAnchor: [24, 24],
+    });
   }
 
-  function stopCamera() {
-    cameraStream?.getTracks().forEach(t => t.stop());
-    cameraStream = null;
+  function questIcon(id, status) {
+    const labels  = ['Ⅰ', 'Ⅱ', 'Ⅲ'];
+    const colors  = { found: '#00e676', wrong: '#ff4444', null: '#aaa' };
+    const symbols = { found: '✅', wrong: '❌', null: labels[id] };
+    const color   = colors[status ?? 'null'];
+    const symbol  = symbols[status ?? 'null'];
+    return L.divIcon({
+      className: '',
+      html: `<div class="quest-pin" style="border-color:${color};box-shadow:0 0 12px ${color}80">${symbol}</div>`,
+      iconSize: [44, 44], iconAnchor: [22, 44],
+    });
   }
 
-  function confirmCapture() { phase = 'solved'; }
-  function retakePhoto() { photoUrl = ''; openCamera(); }
-  function resetHunt() {
+  function placeQuestMarkers() {
+    questMarkers.forEach(m => map.removeLayer(m));
+    questMarkers = [];
+    quests.forEach(q => {
+      const m = L.marker([q.lat, q.lng], { icon: questIcon(q.id, statuses[q.id]) }).addTo(map);
+      m.bindPopup(`<b>Quest ${q.id + 1}</b><br/>${statuses[q.id] === 'found' ? '✅ Found!' : statuses[q.id] === 'wrong' ? '❌ Wrong' : '❓ Unsolved'}`);
+      questMarkers.push(m);
+    });
+  }
+
+  function refreshMarker(id) {
+    if (questMarkers[id]) {
+      questMarkers[id].setIcon(questIcon(id, statuses[id]));
+      questMarkers[id].setPopupContent(`<b>Quest ${id + 1}</b><br/>${statuses[id] === 'found' ? '✅ Found!' : '❌ Wrong'}`);
+    }
+  }
+
+  function updateLines() {
+    questLines.forEach(l => map.removeLayer(l));
+    questLines = [];
+    if (!currentPos) return;
+    quests.forEach(q => {
+      if (statuses[q.id]) return; // skip settled quests
+      const color = '#ffcb0570';
+      const l = L.polyline([currentPos, [q.lat, q.lng]], { color: '#ffcb05', weight: 1.5, dashArray: '5 8', opacity: 0.5 }).addTo(map);
+      questLines.push(l);
+    });
+  }
+
+  // ── Quest Detail / Camera ────────────────────────────────────────────
+  function openQuest(id) {
+    activeId = id;
+    photoFile = null;
+    photoPreviewUrl = '';
+    verifyResult = null;
+    phase = 'detail';
+  }
+
+  function onFileSelected(e) {
+    const f = e.target.files[0];
+    if (!f) return;
+    photoFile = f;
+    photoPreviewUrl = URL.createObjectURL(f);
+  }
+
+  function triggerFileInput(capture) {
+    if (capture) fileInput.setAttribute('capture', 'environment');
+    else fileInput.removeAttribute('capture');
+    fileInput.click();
+  }
+
+  async function verifySign() {
+    if (!photoFile || !activeQuest) return;
+    verifying = true;
+    phase = 'verifying';
+    try {
+      const apiBase = (import.meta.env.VITE_BACKEND_URL || '').replace(/\/$/, '');
+      const url = apiBase ? `${apiBase}/api/verify-sign` : '/api/verify-sign';
+      const fd = new FormData();
+      fd.append('file', photoFile);
+      fd.append('street', activeQuest.street);
+      const r = await fetch(url, { method: 'POST', body: fd });
+      verifyResult = await r.json();
+      statuses[activeId] = verifyResult.matched ? 'found' : 'wrong';
+      statuses = { ...statuses };
+      refreshMarker(activeId);
+      updateLines();
+      if (victory) { setTimeout(() => { phase = 'victory'; }, 1200); }
+      else phase = 'result';
+    } catch {
+      verifyResult = { matched: false, ocr_text: 'Network error — check connection.', street: activeQuest.street, confidence: 0 };
+      statuses[activeId] = 'wrong';
+      statuses = { ...statuses };
+      refreshMarker(activeId);
+      phase = 'result';
+    } finally {
+      verifying = false;
+    }
+  }
+
+  function backToMap() {
+    phase = 'questing';
+    activeId = null;
+    photoFile = null;
+    photoPreviewUrl = '';
+    verifyResult = null;
+  }
+
+  function retryQuest(id) {
+    statuses[id] = null;
+    statuses = { ...statuses };
+    refreshMarker(id);
+    updateLines();
+    openQuest(id);
+  }
+
+  function newHunt() {
+    quests = [];
+    statuses = {};
+    distances = {};
+    questsLoaded = false;
+    placeQuestMarkers();
     phase = 'gps';
-    streetName = ''; riddle = ''; photoUrl = '';
-    if (targetMarker) { map.removeLayer(targetMarker); targetMarker = null; }
-    if (line)         { map.removeLayer(line); line = null; }
-    targetPos = null; distance = 0;
-    spawnTarget(currentPos.lat, currentPos.lng);
+    if (currentPos) loadQuests(currentPos.lat, currentPos.lng);
   }
 
-  /* ─── Helpers ────────────────────────────────────── */
-  $: distanceColor = distance < 50 ? '#00e676' : distance < 150 ? '#ffcb05' : '#cc0000';
-  $: distanceLabel = distance < 50 ? 'Very Close!' : distance < 150 ? 'Getting Warm' : `${distance}m Away`;
-  $: huntPhase = phase === 'hunting' || phase === 'camera' || phase === 'captured' || phase === 'solved';
+  // ── Helpers ──────────────────────────────────────────────────────────
+  const QUEST_COLORS = ['#ffcb05', '#3d7dca', '#cc0000'];
+  const QUEST_NAMES  = ['Quest Ⅰ', 'Quest Ⅱ', 'Quest Ⅲ'];
+  const QUEST_EMOJIS = ['📜', '🗺️', '🏰'];
+
+  function distColor(d) {
+    if (d < 50)  return '#00e676';
+    if (d < 150) return '#ffcb05';
+    return '#ff6b6b';
+  }
+  function distLabel(d) {
+    if (d < 50)  return '🔥 Very Close!';
+    if (d < 150) return '🌡️ Getting Warm';
+    return `🧭 ${d}m Away`;
+  }
+  function statusBadge(s) {
+    if (s === 'found') return '✅ Found';
+    if (s === 'wrong') return '❌ Wrong';
+    return '❓ Unsolved';
+  }
 </script>
 
-<!-- ═══ MARKUP ════════════════════════════════════════════════════════ -->
-
+<!-- ═══ MARKUP ═══════════════════════════════════════════════════════════ -->
 <div class="root">
-  <!-- Full-screen map -->
+  <!-- Full-screen map always beneath -->
   <div id="map"></div>
 
-  <!-- HUD top bar -->
-  {#if huntPhase}
-  <div class="hud-top">
-    <div class="hud-logo">🗺️ StreetHunt</div>
-    {#if phase !== 'solved'}
-    <div class="hud-distance" style="color:{distanceColor}">
-      <span class="dist-num">{distance}</span><span class="dist-unit">m</span>
-    </div>
-    {/if}
-  </div>
-  {/if}
+  <!-- Hidden file input for photo capture / gallery -->
+  <input bind:this={fileInput} type="file" accept="image/*" style="display:none"
+    on:change={onFileSelected} />
 
-  <!-- ─── GPS waiting overlay ─── -->
+  <!-- ── GPS waiting ── -->
   {#if phase === 'gps'}
-  <div class="overlay center-flex">
+  <div class="overlay center">
     <div class="splash-card">
-      <div class="pokeball spin">⚙️</div>
-      <h1>StreetHunt</h1>
-      <p>Locking onto your position…</p>
+      <div class="spin-icon">🗺️</div>
+      <h1 class="title-glow">Street Hunt</h1>
+      <p class="sub">Acquiring your wizarding coordinates…</p>
       {#if gpsError}<p class="err">⚠️ {gpsError}</p>{/if}
     </div>
   </div>
   {/if}
 
-  <!-- ─── Loading riddle ─── -->
-  {#if phase === 'loading' || phase === 'loading_riddle'}
-  <div class="overlay center-flex">
+  <!-- ── Loading quests ── -->
+  {#if phase === 'loading'}
+  <div class="overlay center">
     <div class="splash-card">
-      <div class="pokeball spin">🔮</div>
-      <h2>Summoning Clue…</h2>
-      <p>Gemma 2B is crafting your riddle</p>
+      <div class="spin-icon">📜</div>
+      <h2 class="title-glow" style="font-size:1.5rem">Consulting the Marauder's Map…</h2>
+      <p class="sub">Gemma 2B is conjuring 3 mystical quests</p>
     </div>
   </div>
   {/if}
 
-  <!-- ─── Hunting bottom panel ─── -->
-  {#if phase === 'hunting'}
-  <div class="bottom-panel">
-    <div class="panel-handle"></div>
+  <!-- ── Main game screen ── -->
+  {#if phase === 'questing'}
+  <!-- HUD -->
+  <div class="hud-top">
+    <div class="hud-logo">⚡ Street Hunt</div>
+    <div class="hud-score" class:all-found={score === 3}>
+      {score}/3 <span class="score-label">Found</span>
+    </div>
+  </div>
 
-    <div class="radar-row">
-      <div class="radar-badge" style="border-color:{distanceColor}; box-shadow: 0 0 16px {distanceColor}40">
-        <span class="radar-dist" style="color:{distanceColor}">{distance}m</span>
-        <span class="radar-label">{distanceLabel}</span>
+  <!-- Bottom quest cards row -->
+  <div class="quest-row">
+    {#each quests as q}
+    {@const st = statuses[q.id]}
+    {@const dist = distances[q.id] ?? q.nominalDist}
+    <div
+      class="quest-card"
+      class:status-found={st === 'found'}
+      class:status-wrong={st === 'wrong'}
+      on:click={() => openQuest(q.id)}
+      role="button"
+      tabindex="0"
+      on:keydown={e => e.key === 'Enter' && openQuest(q.id)}
+      style="--qcolor:{QUEST_COLORS[q.id]}"
+    >
+      <div class="qcard-top">
+        <span class="qcard-emoji">{QUEST_EMOJIS[q.id]}</span>
+        <span class="qcard-name">{QUEST_NAMES[q.id]}</span>
+        <span class="qcard-status">{statusBadge(st)}</span>
       </div>
-      <div class="compass">🧭</div>
+      <div class="qcard-dist" style="color:{distColor(dist)}">{distLabel(dist)}</div>
+      <p class="qcard-riddle-preview">{q.riddle.slice(0, 80)}…</p>
     </div>
+    {/each}
+  </div>
+  {/if}
 
-    <div class="riddle-card">
-      <div class="riddle-header">
-        <span class="gem-icon">💎</span>
-        <span>Gemma 2B's Riddle</span>
+  <!-- ── Quest Detail ── -->
+  {#if phase === 'detail' && activeQuest}
+  {@const dist = distances[activeId] ?? activeQuest.nominalDist}
+  <div class="overlay slide-up">
+    <div class="detail-card">
+      <!-- Header -->
+      <div class="detail-header" style="border-color:{QUEST_COLORS[activeId]}">
+        <button class="back-btn" on:click={backToMap}>← Map</button>
+        <div class="detail-title">
+          <span>{QUEST_EMOJIS[activeId]}</span>
+          <span>{QUEST_NAMES[activeId]}</span>
+        </div>
+        <div class="dist-badge" style="color:{distColor(dist)};border-color:{distColor(dist)}">
+          <span class="dist-num">{dist}</span><span class="dist-unit">m</span>
+        </div>
       </div>
-      <p class="riddle-text">{riddle || '…'}</p>
-    </div>
 
-    <button class="cta-btn" on:click={openCamera}>
-      📸 Scan Street Sign
-    </button>
-  </div>
-  {/if}
-
-  <!-- ─── Camera view ─── -->
-  {#if phase === 'camera'}
-  <div class="camera-overlay">
-    <!-- svelte-ignore a11y-media-has-caption -->
-    <video bind:this={videoEl} autoplay playsinline class="cam-video"></video>
-
-    <!-- Viewfinder overlay -->
-    <div class="viewfinder">
-      <div class="vf-corner tl"></div>
-      <div class="vf-corner tr"></div>
-      <div class="vf-corner bl"></div>
-      <div class="vf-corner br"></div>
-      <p class="vf-hint">Point at the Street Name Board</p>
-    </div>
-
-    <div class="cam-controls">
-      <button class="cam-cancel" on:click={() => { stopCamera(); phase = 'hunting'; }}>✕</button>
-      <button class="cam-shutter" on:click={takePhoto}><span class="shutter-inner"></span></button>
-      <div style="width:48px"></div><!-- spacer -->
-    </div>
-  </div>
-  {/if}
-
-  <!-- ─── Captured review ─── -->
-  {#if phase === 'captured'}
-  <div class="overlay center-flex">
-    <div class="review-card">
-      <img src={photoUrl} alt="Captured street name" class="review-photo" />
-      <div class="review-actions">
-        <button class="btn-outline" on:click={retakePhoto}>↺ Retake</button>
-        <button class="btn-solid" on:click={confirmCapture}>✓ Confirm</button>
+      <!-- Marauder's Map riddle scroll -->
+      <div class="parchment-card">
+        <div class="parchment-header">
+          <span>📜</span>
+          <span>The Marauder's Clue · Gemma 2B</span>
+        </div>
+        <p class="parchment-text">{activeQuest.riddle}</p>
       </div>
+
+      <!-- Retake or wrong info if already attempted -->
+      {#if statuses[activeId] === 'wrong'}
+      <div class="attempt-note wrong">
+        ❌ Previous attempt incorrect — try a different sign!
+      </div>
+      {/if}
+
+      <!-- Photo section -->
+      {#if !photoPreviewUrl}
+      <div class="upload-actions">
+        <button class="btn-camera" on:click={() => triggerFileInput(true)}>
+          📷 Take Photo
+        </button>
+        <button class="btn-gallery" on:click={() => triggerFileInput(false)}>
+          🖼️ Upload from Gallery
+        </button>
+      </div>
+      {:else}
+      <div class="photo-preview-wrap">
+        <img src={photoPreviewUrl} alt="Street sign photo" class="preview-img" />
+        <div class="preview-actions">
+          <button class="btn-retake" on:click={() => { photoFile = null; photoPreviewUrl = ''; }}>
+            ↺ Retake
+          </button>
+          <button class="btn-verify" on:click={verifySign}>
+            ✨ Verify Sign
+          </button>
+        </div>
+      </div>
+      {/if}
     </div>
   </div>
   {/if}
 
-  <!-- ─── Victory screen ─── -->
-  {#if phase === 'solved'}
-  <div class="overlay center-flex victory-bg">
+  <!-- ── Verifying ── -->
+  {#if phase === 'verifying'}
+  <div class="overlay center">
+    <div class="splash-card">
+      <div class="spin-icon">🔮</div>
+      <h2 class="title-glow" style="font-size:1.3rem">The Marauder's Map is reading the sign…</h2>
+      <p class="sub">Gemini Vision OCR at work ✨</p>
+    </div>
+  </div>
+  {/if}
+
+  <!-- ── OCR Result ── -->
+  {#if phase === 'result' && verifyResult && activeQuest}
+  <div class="overlay center">
+    <div class="result-card" class:result-found={verifyResult.matched} class:result-wrong={!verifyResult.matched}>
+
+      <div class="result-big-icon">{verifyResult.matched ? '🎉' : '❌'}</div>
+      <h2 class="result-title">{verifyResult.matched ? 'Quest Complete!' : 'Not Quite Right…'}</h2>
+
+      <div class="ocr-box">
+        <div class="ocr-label">📸 Sign OCR Read:</div>
+        <div class="ocr-text">"{verifyResult.ocr_text}"</div>
+        {#if verifyResult.matched}
+        <div class="ocr-label" style="margin-top:0.4rem">🎯 Matched: {activeQuest.street}</div>
+        {/if}
+        <div class="ocr-conf">Confidence: {Math.round(verifyResult.confidence * 100)}%</div>
+      </div>
+
+      {#if verifyResult.matched}
+      <p class="result-sub">
+        ⚡ "{activeQuest.street}" is marked on the Marauder's Map! {score}/3 quests done.
+      </p>
+      <button class="cta-btn green" on:click={backToMap}>← Back to Map</button>
+      {:else}
+      <p class="result-sub">
+        The enchanted map sees "{verifyResult.ocr_text}" — look for a different sign!
+      </p>
+      <div class="result-actions">
+        <button class="cta-btn red" on:click={() => retryQuest(activeId)}>🔁 Retry Quest</button>
+        <button class="cta-btn outline" on:click={backToMap}>← Map</button>
+      </div>
+      {/if}
+    </div>
+  </div>
+  {/if}
+
+  <!-- ── Victory ── -->
+  {#if phase === 'victory'}
+  <div class="overlay center victory-bg">
     <div class="victory-card">
-      <div class="victory-trophy">🏆</div>
-      <h2 class="victory-title">Street Found!</h2>
-      <p class="victory-street">{streetName}</p>
-      <img src={photoUrl} alt="Street sign" class="victory-photo" />
-      <p class="victory-sub">You solved the riddle and captured proof!</p>
-      <button class="cta-btn" style="width:100%;margin-top:1rem" on:click={resetHunt}>
-        🗺️ New Hunt
+      <div class="trophy-bounce">🏆</div>
+      <h1 class="victory-title">All Quests Complete!</h1>
+      <p class="victory-sub">You've mastered the Marauder's Map and claimed all three streets!</p>
+
+      <div class="quest-summary">
+        {#each quests as q}
+        <div class="summary-row">
+          <span>{QUEST_EMOJIS[q.id]} {QUEST_NAMES[q.id]}</span>
+          <span style="color:#ffcb05;font-weight:700">{q.street}</span>
+          <span>{statuses[q.id] === 'found' ? '✅' : '❌'}</span>
+        </div>
+        {/each}
+      </div>
+
+      <button class="cta-btn" style="width:100%;margin-top:1.2rem" on:click={newHunt}>
+        🗺️ Start New Hunt
       </button>
     </div>
   </div>
   {/if}
 </div>
 
-<!-- Hidden canvas for photo capture -->
-<canvas bind:this={canvasEl} style="display:none"></canvas>
-
-<!-- ═══ STYLES ═════════════════════════════════════════════════════════ -->
+<!-- ═══ STYLES ══════════════════════════════════════════════════════════ -->
 <style>
   /* ── Layout ── */
-  .root {
-    position: fixed;
-    inset: 0;
-    display: flex;
-    flex-direction: column;
-  }
-  :global(#map) {
-    position: absolute;
-    inset: 0;
-    z-index: 0;
-  }
+  .root { position: fixed; inset: 0; display: flex; flex-direction: column; }
+  :global(#map) { position: absolute; inset: 0; z-index: 0; }
 
   /* ── Overlays ── */
   .overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 300;
-    background: rgba(10, 10, 24, 0.82);
-    backdrop-filter: blur(6px);
+    position: fixed; inset: 0; z-index: 300;
+    background: rgba(8,10,22,0.88);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
   }
-  .center-flex {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 1.5rem;
-  }
-  .victory-bg {
-    background: linear-gradient(160deg, rgba(0,0,0,0.9) 0%, rgba(26,58,107,0.9) 100%);
-  }
+  .center { display: flex; align-items: center; justify-content: center; padding: 1.5rem; }
+  .slide-up { overflow-y: auto; padding: 1rem; }
+  .victory-bg { background: linear-gradient(160deg, rgba(0,0,0,0.92) 0%, rgba(20,40,90,0.92) 100%); }
 
-  /* ── Splash / loading card ── */
+  /* ── Splash card ── */
   .splash-card {
+    display: flex; flex-direction: column; align-items: center; gap: 0.8rem;
     text-align: center;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.75rem;
   }
-  .splash-card h1 {
-    font-size: 2rem;
-    font-weight: 900;
-    color: #ffcb05;
-    text-shadow: 0 0 20px #ffcb0580;
-    letter-spacing: 2px;
-  }
-  .splash-card h2 { color: #ffcb05; font-size: 1.4rem; }
-  .splash-card p  { color: rgba(255,255,255,0.75); font-size: 0.95rem; }
-  .err { color: #ff6b6b !important; }
-
-  .pokeball {
-    font-size: 3.5rem;
-    display: block;
-  }
-  .spin { animation: spin 1.5s linear infinite; }
+  .spin-icon { font-size: 3.5rem; animation: spin 2s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .title-glow {
+    font-size: 2rem; font-weight: 900;
+    color: #ffcb05; letter-spacing: 2px;
+    text-shadow: 0 0 20px #ffcb0570;
+  }
+  .sub  { color: rgba(255,255,255,0.65); font-size: 0.9rem; }
+  .err  { color: #ff6b6b; font-size: 0.85rem; }
 
-  /* ── Top HUD ── */
+  /* ── HUD ── */
   .hud-top {
-    position: absolute;
-    top: 0;
-    left: 0;
-    right: 0;
-    z-index: 200;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+    position: absolute; top: 0; left: 0; right: 0; z-index: 200;
+    display: flex; align-items: center; justify-content: space-between;
     padding: 0.6rem 1rem;
-    background: linear-gradient(to bottom, rgba(10,10,24,0.9) 0%, transparent 100%);
+    background: linear-gradient(to bottom, rgba(8,10,22,0.9), transparent);
     pointer-events: none;
   }
-  .hud-logo {
-    font-size: 1rem;
-    font-weight: 900;
-    color: #ffcb05;
-    letter-spacing: 1px;
-    text-shadow: 0 0 10px #ffcb0580;
+  .hud-logo { font-size: 0.9rem; font-weight: 900; color: #ffcb05; text-shadow: 0 0 10px #ffcb0550; letter-spacing: 1px; }
+  .hud-score {
+    font-size: 1rem; font-weight: 900; color: #aaa;
+    display: flex; align-items: baseline; gap: 0.3rem;
   }
-  .hud-distance {
-    font-size: 0.85rem;
-    font-weight: 700;
-    display: flex;
-    align-items: baseline;
-    gap: 2px;
-  }
-  .dist-num { font-size: 1.6rem; font-weight: 900; }
-  .dist-unit { font-size: 0.8rem; opacity: 0.8; }
+  .hud-score.all-found { color: #00e676; text-shadow: 0 0 10px #00e67660; }
+  .score-label { font-size: 0.7rem; font-weight: 600; opacity: 0.8; }
 
-  /* ── Bottom panel (hunting) ── */
-  .bottom-panel {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
-    z-index: 200;
-    background: var(--poke-panel);
-    border-top: 1px solid var(--glass-border);
-    border-radius: 24px 24px 0 0;
-    padding: 0.5rem 1.25rem 1.25rem;
-    backdrop-filter: blur(16px);
-    -webkit-backdrop-filter: blur(16px);
-    display: flex;
-    flex-direction: column;
-    gap: 0.85rem;
+  /* ── Quest cards row ── */
+  .quest-row {
+    position: absolute; bottom: 0; left: 0; right: 0; z-index: 200;
+    display: flex; gap: 0.75rem; overflow-x: auto; padding: 1rem;
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+    scroll-snap-type: x mandatory;
+    -webkit-overflow-scrolling: touch;
+    background: linear-gradient(to top, rgba(8,10,22,0.95) 60%, transparent);
   }
-  .panel-handle {
-    width: 40px;
-    height: 4px;
-    background: rgba(255,255,255,0.2);
-    border-radius: 2px;
-    align-self: center;
-    margin-bottom: 0.25rem;
-  }
+  .quest-row::-webkit-scrollbar { display: none; }
 
-  /* Radar row */
-  .radar-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .radar-badge {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    border: 2px solid;
-    border-radius: 50px;
-    padding: 0.5rem 1.1rem;
-    min-width: 110px;
-    transition: all 0.4s ease;
-  }
-  .radar-dist  { font-size: 1.5rem; font-weight: 900; line-height: 1; }
-  .radar-label { font-size: 0.7rem; opacity: 0.8; font-weight: 600; letter-spacing: 0.5px; }
-  .compass { font-size: 2rem; }
-
-  /* Riddle card */
-  .riddle-card {
-    background: rgba(61, 125, 202, 0.15);
-    border: 1px solid rgba(61, 125, 202, 0.4);
-    border-radius: 14px;
+  .quest-card {
+    flex: 0 0 260px;
+    scroll-snap-align: start;
+    background: rgba(255,255,255,0.05);
+    border: 1.5px solid var(--qcolor, #ffcb05);
+    border-radius: 18px;
     padding: 0.85rem 1rem;
-  }
-  .riddle-header {
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-size: 0.7rem;
-    font-weight: 700;
-    letter-spacing: 1px;
-    color: #3d7dca;
-    text-transform: uppercase;
-    margin-bottom: 0.5rem;
-  }
-  .gem-icon { font-size: 0.9rem; }
-  .riddle-text {
-    font-size: 0.95rem;
-    line-height: 1.6;
-    color: rgba(255,255,255,0.9);
-    font-style: italic;
-  }
-
-  /* CTA button */
-  .cta-btn {
-    width: 100%;
-    padding: 0.9rem;
-    background: linear-gradient(135deg, #cc0000 0%, #ff4444 100%);
-    color: white;
-    border: none;
-    border-radius: 50px;
-    font-family: 'Exo 2', sans-serif;
-    font-size: 1rem;
-    font-weight: 700;
-    letter-spacing: 0.5px;
     cursor: pointer;
-    box-shadow: 0 4px 20px rgba(204, 0, 0, 0.5);
-    transition: transform 0.1s, box-shadow 0.1s;
+    transition: transform 0.15s, box-shadow 0.15s;
+    box-shadow: 0 0 15px rgba(0,0,0,0.4);
+  }
+  .quest-card:active { transform: scale(0.97); }
+  .quest-card.status-found { border-color: #00e676; background: rgba(0,230,118,0.07); }
+  .quest-card.status-wrong { border-color: #ff4444; background: rgba(255,68,68,0.07); }
+
+  .qcard-top { display: flex; align-items: center; gap: 0.4rem; margin-bottom: 0.4rem; }
+  .qcard-emoji { font-size: 1rem; }
+  .qcard-name  { font-size: 0.75rem; font-weight: 900; letter-spacing: 1px; color: #ffcb05; flex: 1; }
+  .qcard-status { font-size: 0.65rem; font-weight: 700; color: rgba(255,255,255,0.6); }
+  .qcard-dist  { font-size: 0.75rem; font-weight: 700; margin-bottom: 0.4rem; }
+  .qcard-riddle-preview { font-size: 0.75rem; color: rgba(255,255,255,0.7); font-style: italic; line-height: 1.4; margin: 0; }
+
+  /* ── Detail card ── */
+  .detail-card {
+    background: rgba(10,12,26,0.97);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 24px;
+    padding: 1rem;
+    display: flex; flex-direction: column; gap: 1rem;
+    max-width: 480px; margin: 0 auto;
+    min-height: 60vh;
+  }
+  .detail-header {
+    display: flex; align-items: center; gap: 0.75rem;
+    padding-bottom: 0.75rem; border-bottom: 1px solid rgba(255,255,255,0.1);
+  }
+  .back-btn {
+    background: transparent; border: 1px solid rgba(255,255,255,0.25);
+    color: rgba(255,255,255,0.8); border-radius: 50px; padding: 0.3rem 0.75rem;
+    font-size: 0.75rem; font-weight: 700; cursor: pointer;
+  }
+  .detail-title {
+    flex: 1; display: flex; align-items: center; gap: 0.4rem;
+    font-size: 1rem; font-weight: 900; color: #ffcb05; letter-spacing: 1px;
+  }
+  .dist-badge {
+    border: 2px solid; border-radius: 50px; padding: 0.2rem 0.65rem;
+    display: flex; align-items: baseline; gap: 2px;
+  }
+  .dist-num { font-size: 1.2rem; font-weight: 900; line-height: 1; }
+  .dist-unit { font-size: 0.65rem; opacity: 0.75; }
+
+  /* ── Parchment riddle card ── */
+  .parchment-card {
+    background: linear-gradient(135deg, rgba(120, 80, 10, 0.25) 0%, rgba(60, 30, 0, 0.35) 100%);
+    border: 1px solid rgba(255,203,5,0.35);
+    border-radius: 16px; padding: 1rem;
+  }
+  .parchment-header {
+    display: flex; align-items: center; gap: 0.4rem;
+    font-size: 0.65rem; font-weight: 900; letter-spacing: 1.5px;
+    text-transform: uppercase; color: #ffcb05; margin-bottom: 0.7rem;
+  }
+  .parchment-text {
+    font-size: 0.9rem; line-height: 1.7; color: rgba(255,240,200,0.92);
+    font-style: italic; white-space: pre-wrap; margin: 0;
+  }
+
+  /* ── Attempt note ── */
+  .attempt-note {
+    border-radius: 10px; padding: 0.6rem 0.9rem;
+    font-size: 0.8rem; font-weight: 700;
+  }
+  .attempt-note.wrong { background: rgba(255,68,68,0.12); border: 1px solid rgba(255,68,68,0.35); color: #ff9999; }
+
+  /* ── Upload actions ── */
+  .upload-actions { display: flex; flex-direction: column; gap: 0.75rem; }
+  .btn-camera {
+    padding: 1rem; background: linear-gradient(135deg, #cc0000, #ff4444);
+    border: none; border-radius: 50px; color: white;
+    font-family: 'Exo 2', sans-serif; font-size: 1rem; font-weight: 700;
+    cursor: pointer; box-shadow: 0 4px 20px rgba(204,0,0,0.4);
+    letter-spacing: 0.5px; text-transform: uppercase;
+  }
+  .btn-gallery {
+    padding: 0.85rem; background: rgba(255,255,255,0.07);
+    border: 1.5px solid rgba(255,255,255,0.25); border-radius: 50px;
+    color: rgba(255,255,255,0.85); font-family: 'Exo 2', sans-serif;
+    font-size: 0.95rem; font-weight: 700; cursor: pointer; letter-spacing: 0.5px;
     text-transform: uppercase;
   }
-  .cta-btn:active { transform: scale(0.97); box-shadow: 0 2px 10px rgba(204,0,0,0.4); }
 
-  /* ── Player / target map icons ── */
-  :global(.player-dot) {
-    width: 48px; height: 48px;
-    display: flex; align-items: center; justify-content: center;
-    position: relative;
+  /* ── Photo preview ── */
+  .photo-preview-wrap { display: flex; flex-direction: column; gap: 0.75rem; }
+  .preview-img { width: 100%; max-height: 220px; object-fit: cover; border-radius: 14px; border: 1px solid rgba(255,255,255,0.15); }
+  .preview-actions { display: flex; gap: 0.75rem; }
+  .btn-retake {
+    flex: 1; padding: 0.75rem; border-radius: 50px;
+    background: transparent; border: 2px solid rgba(255,255,255,0.25);
+    color: white; font-family: 'Exo 2', sans-serif; font-size: 0.9rem; font-weight: 700;
+    cursor: pointer;
   }
-  :global(.player-pulse) {
-    position: absolute;
-    inset: 0;
-    border-radius: 50%;
-    background: rgba(61,125,202,0.4);
-    animation: pulse 2s ease-out infinite;
-  }
-  :global(.player-inner) { font-size: 1.6rem; z-index: 1; position: relative; }
-  :global(.target-pin) { font-size: 2rem; filter: drop-shadow(0 0 6px rgba(255,203,5,0.8)); }
-  @keyframes pulse {
-    0%   { transform: scale(0.8); opacity: 0.8; }
-    70%  { transform: scale(1.8); opacity: 0; }
-    100% { transform: scale(0.8); opacity: 0; }
+  .btn-verify {
+    flex: 2; padding: 0.75rem; border-radius: 50px;
+    background: linear-gradient(135deg, #1a5c2e, #00c853);
+    border: none; color: white; font-family: 'Exo 2', sans-serif;
+    font-size: 0.9rem; font-weight: 700; cursor: pointer;
+    box-shadow: 0 4px 15px rgba(0,200,83,0.4); letter-spacing: 0.5px;
+    text-transform: uppercase;
   }
 
-  /* ── Camera overlay ── */
-  .camera-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 400;
-    background: #000;
-    display: flex;
-    flex-direction: column;
-  }
-  .cam-video {
-    flex: 1;
-    width: 100%;
-    object-fit: cover;
-  }
-  .viewfinder {
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -60%);
-    width: min(80vw, 340px);
-    height: 160px;
-    pointer-events: none;
-  }
-  .vf-corner {
-    position: absolute;
-    width: 28px; height: 28px;
-    border-color: #ffcb05;
-    border-style: solid;
-  }
-  .vf-corner.tl { top: 0; left: 0;  border-width: 3px 0 0 3px; border-radius: 4px 0 0 0; }
-  .vf-corner.tr { top: 0; right: 0; border-width: 3px 3px 0 0; border-radius: 0 4px 0 0; }
-  .vf-corner.bl { bottom: 0; left: 0;  border-width: 0 0 3px 3px; border-radius: 0 0 0 4px; }
-  .vf-corner.br { bottom: 0; right: 0; border-width: 0 3px 3px 0; border-radius: 0 0 4px 0; }
-  .vf-hint {
-    position: absolute;
-    bottom: -30px;
-    left: 50%;
-    transform: translateX(-50%);
-    white-space: nowrap;
-    color: rgba(255,255,255,0.8);
-    font-size: 0.8rem;
+  /* ── Result card ── */
+  .result-card {
+    background: rgba(10,12,26,0.98);
+    border: 2px solid rgba(255,255,255,0.1);
+    border-radius: 24px; padding: 1.75rem 1.5rem;
+    width: 100%; max-width: 420px;
+    display: flex; flex-direction: column; align-items: center; gap: 1rem;
     text-align: center;
   }
-  .cam-controls {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 1.2rem 2rem 2.5rem;
-    background: rgba(0,0,0,0.6);
-    backdrop-filter: blur(10px);
+  .result-card.result-found { border-color: rgba(0,230,118,0.5); box-shadow: 0 0 30px rgba(0,230,118,0.15); }
+  .result-card.result-wrong { border-color: rgba(255,68,68,0.5); box-shadow: 0 0 30px rgba(255,68,68,0.15); }
+  .result-big-icon { font-size: 4rem; animation: pop 0.4s ease; }
+  @keyframes pop { 0% { transform: scale(0); } 80% { transform: scale(1.15); } 100% { transform: scale(1); } }
+  .result-title { font-size: 1.6rem; font-weight: 900; color: #ffcb05; margin: 0; }
+  .ocr-box {
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px; padding: 0.85rem 1rem; width: 100%; text-align: left;
   }
-  .cam-cancel {
-    width: 48px; height: 48px;
-    background: rgba(255,255,255,0.15);
-    border: 1px solid rgba(255,255,255,0.3);
-    border-radius: 50%;
-    color: #fff;
-    font-size: 1.2rem;
-    cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-  }
-  .cam-shutter {
-    width: 72px; height: 72px;
-    background: rgba(255,255,255,0.9);
-    border: 4px solid #fff;
-    border-radius: 50%;
-    cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 0 0 6px rgba(255,255,255,0.3);
-    transition: transform 0.1s;
-  }
-  .cam-shutter:active { transform: scale(0.92); }
-  .shutter-inner {
-    width: 56px; height: 56px;
-    background: #fff;
-    border-radius: 50%;
-    border: 3px solid rgba(0,0,0,0.15);
-  }
+  .ocr-label { font-size: 0.65rem; font-weight: 900; letter-spacing: 1px; color: #aaa; text-transform: uppercase; }
+  .ocr-text  { font-size: 0.9rem; font-weight: 700; color: white; margin-top: 0.3rem; font-style: italic; }
+  .ocr-conf  { font-size: 0.65rem; color: rgba(255,255,255,0.45); margin-top: 0.4rem; }
+  .result-sub { font-size: 0.8rem; color: rgba(255,255,255,0.65); margin: 0; }
+  .result-actions { display: flex; gap: 0.75rem; width: 100%; }
 
-  /* ── Review ── */
-  .review-card {
-    background: var(--poke-panel);
-    border: 1px solid var(--glass-border);
-    border-radius: 20px;
-    overflow: hidden;
-    width: 100%;
-    max-width: 420px;
-  }
-  .review-photo {
-    width: 100%;
-    max-height: 50vh;
-    object-fit: cover;
-    display: block;
-  }
-  .review-actions {
-    display: flex;
-    gap: 0.75rem;
-    padding: 1rem;
-  }
-  .btn-outline {
+  /* ── CTAs ── */
+  .cta-btn {
+    padding: 0.9rem 1.5rem; border-radius: 50px; border: none;
+    font-family: 'Exo 2', sans-serif; font-size: 0.95rem; font-weight: 700;
+    letter-spacing: 0.5px; text-transform: uppercase; cursor: pointer;
     flex: 1;
-    padding: 0.75rem;
-    background: transparent;
-    border: 2px solid rgba(255,255,255,0.3);
-    color: #fff;
-    border-radius: 50px;
-    font-family: 'Exo 2', sans-serif;
-    font-size: 0.95rem;
-    font-weight: 700;
-    cursor: pointer;
+    background: linear-gradient(135deg, #cc0000, #ff4444);
+    color: white; box-shadow: 0 4px 18px rgba(204,0,0,0.4);
+    transition: transform 0.1s; width: auto;
   }
-  .btn-solid {
-    flex: 2;
-    padding: 0.75rem;
-    background: linear-gradient(135deg, #1a6b2a 0%, #00e676 100%);
-    border: none;
-    color: #fff;
-    border-radius: 50px;
-    font-family: 'Exo 2', sans-serif;
-    font-size: 0.95rem;
-    font-weight: 700;
-    cursor: pointer;
-    box-shadow: 0 4px 15px rgba(0,230,118,0.4);
-  }
+  .cta-btn:active { transform: scale(0.97); }
+  .cta-btn.green { background: linear-gradient(135deg, #1a5c2e, #00c853); box-shadow: 0 4px 18px rgba(0,200,83,0.4); }
+  .cta-btn.red   { background: linear-gradient(135deg, #8b0000, #cc0000); box-shadow: 0 4px 18px rgba(204,0,0,0.4); }
+  .cta-btn.outline { background: transparent; border: 2px solid rgba(255,255,255,0.3); color: white; box-shadow: none; }
 
   /* ── Victory ── */
   .victory-card {
-    background: linear-gradient(160deg, rgba(26,58,107,0.95) 0%, rgba(10,10,24,0.95) 100%);
+    background: linear-gradient(160deg, rgba(15,25,55,0.98), rgba(8,10,20,0.98));
     border: 1px solid rgba(255,203,5,0.4);
-    border-radius: 24px;
-    padding: 2rem 1.5rem;
-    width: 100%;
-    max-width: 420px;
-    text-align: center;
-    box-shadow: 0 0 40px rgba(255,203,5,0.2);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.75rem;
-    max-height: 90vh;
-    overflow-y: auto;
+    border-radius: 28px; padding: 2rem 1.5rem;
+    width: 100%; max-width: 430px; text-align: center;
+    display: flex; flex-direction: column; align-items: center; gap: 0.9rem;
+    box-shadow: 0 0 50px rgba(255,203,5,0.15);
+    max-height: 90vh; overflow-y: auto;
   }
-  .victory-trophy {
-    font-size: 4rem;
-    animation: bounce 0.8s ease infinite alternate;
+  .trophy-bounce { font-size: 5rem; animation: bounce 0.8s ease-in-out infinite alternate; }
+  @keyframes bounce { to { transform: translateY(-12px); } }
+  .victory-title { font-size: 1.8rem; font-weight: 900; color: #ffcb05; text-shadow: 0 0 20px #ffcb0560; margin: 0; }
+  .victory-sub { font-size: 0.85rem; color: rgba(255,255,255,0.6); margin: 0; }
+  .quest-summary { width: 100%; display: flex; flex-direction: column; gap: 0.5rem; }
+  .summary-row {
+    display: flex; align-items: center; justify-content: space-between;
+    background: rgba(255,255,255,0.05); border-radius: 10px;
+    padding: 0.5rem 0.8rem; font-size: 0.8rem;
   }
-  @keyframes bounce { to { transform: translateY(-8px); } }
-  .victory-title {
-    font-size: 1.8rem;
-    font-weight: 900;
-    color: #ffcb05;
-    text-shadow: 0 0 20px #ffcb0580;
+
+  /* ── Map markers ── */
+  :global(.player-dot) {
+    width: 48px; height: 48px; display: flex; align-items: center; justify-content: center;
+    position: relative;
   }
-  .victory-street {
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: #3d7dca;
-    background: rgba(61,125,202,0.15);
-    border: 1px solid rgba(61,125,202,0.4);
-    border-radius: 50px;
-    padding: 0.4rem 1.2rem;
+  :global(.player-pulse) {
+    position: absolute; inset: 0; border-radius: 50%;
+    background: rgba(61,125,202,0.4); animation: pulse 2s ease-out infinite;
   }
-  .victory-photo {
-    width: 100%;
-    max-height: 200px;
-    object-fit: cover;
-    border-radius: 14px;
-    border: 2px solid rgba(255,203,5,0.3);
+  :global(.player-inner) { font-size: 1.6rem; z-index: 1; position: relative; }
+  @keyframes pulse { 0% { transform: scale(0.8); opacity: 0.8; } 70% { transform: scale(2); opacity: 0; } 100% { transform: scale(0.8); opacity: 0; } }
+  :global(.quest-pin) {
+    width: 44px; height: 44px; border-radius: 50% 50% 50% 0;
+    border: 2.5px solid;
+    background: rgba(10,12,26,0.9); display: flex; align-items: center; justify-content: center;
+    font-size: 1.1rem; transform: rotate(-45deg);
+    box-shadow: 0 2px 8px rgba(0,0,0,0.5);
   }
-  .victory-sub {
-    font-size: 0.85rem;
-    color: rgba(255,255,255,0.6);
-  }
+  :global(.quest-pin > *), :global(.quest-pin)::after { transform: rotate(45deg); }
 </style>
