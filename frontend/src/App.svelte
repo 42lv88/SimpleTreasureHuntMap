@@ -59,7 +59,9 @@
     if (!url.startsWith('http')) url = 'https://' + url;
     
     try {
-      const r = await fetch(`${url}/api`);
+      const r = await fetch(`${url}/api`, {
+        headers: { 'Bypass-Tunnel-Reminder': 'true' }
+      });
       if (!r.ok) throw new Error('Server error');
       const data = await r.json();
       if (data.status === 'ok') {
@@ -125,7 +127,10 @@
       const url = apiBase ? `${apiBase}/api/generate-quests` : '/api/generate-quests';
       const r = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Bypass-Tunnel-Reminder': 'true'
+        },
         body: JSON.stringify({ lat, lng }),
       });
       const data = await r.json();
@@ -230,7 +235,11 @@
       const fd = new FormData();
       fd.append('file', photoFile);
       fd.append('street', activeQuest.street);
-      const r = await fetch(url, { method: 'POST', body: fd });
+      const r = await fetch(url, { 
+        method: 'POST', 
+        headers: { 'Bypass-Tunnel-Reminder': 'true' },
+        body: fd 
+      });
       verifyResult = await r.json();
       statuses[activeId] = verifyResult.matched ? 'found' : 'wrong';
       statuses = { ...statuses };
