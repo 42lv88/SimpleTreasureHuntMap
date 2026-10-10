@@ -229,7 +229,7 @@ class QuestRequest(BaseModel):
     lng: float
 
 
-@app.get("/api")
+@app.get("/")
 def health_check():
     """Returns 200 OK and tells the frontend whether the AI model is connected."""
     return {
@@ -238,7 +238,7 @@ def health_check():
     }
 
 
-@app.post("/api/generate-quests")
+@app.post("/generate-quests")
 async def generate_quests(req: QuestRequest):
     """
     Takes the player's GPS position and returns 3 quests.
@@ -279,7 +279,7 @@ async def generate_quests(req: QuestRequest):
     return {"quests": quests}
 
 
-@app.post("/api/verify-sign")
+@app.post("/verify-sign")
 async def verify_sign(
     file:   UploadFile = File(...),   # photo taken by the player
     street: str        = Form(...),   # target street name sent from the frontend
@@ -337,5 +337,7 @@ async def verify_sign(
 
 
 # ─── Vercel Serverless Handler ────────────────────────────────────────────────
-# Mangum converts Vercel's Lambda-style request into ASGI that FastAPI can handle
-handler = Mangum(app, lifespan="off")
+# Vercel rewrites /api/* → this file, so Mangum sees paths like /generate-quests.
+# api_gateway_base_path="/api" tells Mangum to strip the /api prefix before
+# matching FastAPI routes (which are defined as /, /generate-quests, /verify-sign).
+handler = Mangum(app, lifespan="off", api_gateway_base_path="/api")
